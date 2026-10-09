@@ -1,0 +1,116 @@
+spring:
+  application:
+    name: webhook-reconciliation-engine
+
+  # PostgreSQL
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:webhook_engine}
+    username: ${DB_USERNAME:webhook_user}
+    password: ${DB_PASSWORD:webhook_pass}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      minimum-idle: 2
+      connection-timeout: 20000
+      idle-timeout: 300000
+      max-lifetime: 1200000
+
+  # JPA / Hibernate
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: false
+
+  # Flyway
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  # RabbitMQ
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+    virtual-host: ${RABBITMQ_VHOST:/}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    listener:
+      simple:
+        acknowledge-mode: auto
+        default-requeue-rejected: false
+
+# Application Messaging Properties
+app:
+  rabbitmq:
+    exchange: ${WEBHOOK_EXCHANGE:webhook.events}
+    queue: ${WEBHOOK_QUEUE:webhook.processing}
+    routing-key: ${WEBHOOK_ROUTING_KEY:webhook.received}
+  outbox:
+    enabled: ${OUTBOX_ENABLED:true}
+    polling-interval-ms: ${OUTBOX_POLLING_INTERVAL_MS:2000}
+    batch-size: ${OUTBOX_BATCH_SIZE:10}
+  retry:
+    enabled: ${RETRY_ENABLED:true}
+    max-attempts: ${RETRY_MAX_ATTEMPTS:5}
+    initial-delay-ms: ${RETRY_INITIAL_DELAY_MS:1000}
+    multiplier: ${RETRY_MULTIPLIER:2.0}
+    max-delay-ms: ${RETRY_MAX_DELAY_MS:60000}
+    scheduler-interval-ms: ${RETRY_SCHEDULER_INTERVAL_MS:1000}
+    batch-size: ${RETRY_BATCH_SIZE:20}
+
+  # Redis
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 5000ms
+
+  # Graceful Shutdown
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+# Server
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+# Actuator
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+      show-components: always
+  health:
+    rabbit:
+      enabled: true
+    redis:
+      enabled: true
+    db:
+      enabled: true
+
+# OpenAPI
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    enabled: true
+
+# Logging
+logging:
+  level:
+    root: INFO
+    com.example.webhookengine: DEBUG
+    org.springframework.amqp: INFO
+    org.flywaydb: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
