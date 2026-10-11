@@ -41,7 +41,13 @@ spring:
     listener:
       simple:
         acknowledge-mode: auto
-        default-requeue-rejected: false
+  # Redis
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 5000ms
 
 # Application Messaging Properties
 app:
@@ -61,14 +67,16 @@ app:
     max-delay-ms: ${RETRY_MAX_DELAY_MS:60000}
     scheduler-interval-ms: ${RETRY_SCHEDULER_INTERVAL_MS:1000}
     batch-size: ${RETRY_BATCH_SIZE:20}
-
-  # Redis
-  data:
-    redis:
-      host: ${REDIS_HOST:localhost}
-      port: ${REDIS_PORT:6379}
-      password: ${REDIS_PASSWORD:}
-      timeout: 5000ms
+  security:
+    bootstrap:
+      username: ${APP_SECURITY_BOOTSTRAP_USERNAME:}
+      password: ${APP_SECURITY_BOOTSTRAP_PASSWORD:}
+  rate-limit:
+    enabled: ${RATE_LIMIT_ENABLED:true}
+    capacity: ${RATE_LIMIT_CAPACITY:60}
+    window-seconds: ${RATE_LIMIT_WINDOW_SECONDS:60}
+    key-strategy: ${RATE_LIMIT_KEY_STRATEGY:source}
+    fail-closed: ${RATE_LIMIT_FAIL_CLOSED:true}
 
   # Graceful Shutdown
   lifecycle:

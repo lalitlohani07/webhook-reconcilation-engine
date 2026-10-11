@@ -28,6 +28,11 @@ public interface WebhookEventRepository extends JpaRepository<WebhookEvent, UUID
         org.springframework.data.domain.Pageable pageable
     );
 
+    org.springframework.data.domain.Page<WebhookEvent> findByStatus(
+        WebhookStatus status,
+        org.springframework.data.domain.Pageable pageable
+    );
+
     @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
     @org.springframework.data.jpa.repository.Query(
         "UPDATE WebhookEvent w SET w.status = :newStatus, w.updatedAt = :now WHERE w.id = :id AND w.status = :currentStatus"
@@ -37,5 +42,34 @@ public interface WebhookEventRepository extends JpaRepository<WebhookEvent, UUID
         @org.springframework.data.repository.query.Param("currentStatus") WebhookStatus currentStatus,
         @org.springframework.data.repository.query.Param("newStatus") WebhookStatus newStatus,
         @org.springframework.data.repository.query.Param("now") Instant now
+    );
+
+    @org.springframework.data.jpa.repository.Modifying(clearAutomatically = true, flushAutomatically = true)
+    @org.springframework.data.jpa.repository.Query(
+        "UPDATE WebhookEvent w SET w.status = :newStatus, w.nextRetryAt = NULL, w.updatedAt = :now WHERE w.id = :id AND w.status = :currentStatus"
+    )
+    int claimEventForReplay(
+        @org.springframework.data.repository.query.Param("id") UUID id,
+        @org.springframework.data.repository.query.Param("currentStatus") WebhookStatus currentStatus,
+        @org.springframework.data.repository.query.Param("newStatus") WebhookStatus newStatus,
+        @org.springframework.data.repository.query.Param("now") Instant now
+    );
+
+    @org.springframework.data.jpa.repository.Query(
+        "SELECT w FROM WebhookEvent w WHERE w.status IN :statuses AND (:source IS NULL OR w.source = :source) AND w.id NOT IN (SELECT r.webhookEvent.id FROM ReconciliationRecord r) ORDER BY w.createdAt ASC"
+    )
+    List<WebhookEvent> findEligibleUnreconciledEvents(
+        @org.springframework.data.repository.query.Param("statuses") List<WebhookStatus> statuses,
+        @org.springframework.data.repository.query.Param("source") String source,
+        org.springframework.data.domain.Pageable pageable
+    );
+
+    @org.springframework.data.jpa.repository.Query(
+        "SELECT w FROM WebhookEvent w WHERE w.status IN :statuses AND (:source IS NULL OR w.source = :source) ORDER BY w.createdAt ASC"
+    )
+    List<WebhookEvent> findEligibleEvents(
+        @org.springframework.data.repository.query.Param("statuses") List<WebhookStatus> statuses,
+        @org.springframework.data.repository.query.Param("source") String source,
+        org.springframework.data.domain.Pageable pageable
     );
 }

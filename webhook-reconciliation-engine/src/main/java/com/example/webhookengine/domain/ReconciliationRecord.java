@@ -15,10 +15,16 @@ import org.hibernate.type.SqlTypes;
 
 import java.time.Instant;
 import java.util.Objects;
+import jakarta.persistence.UniqueConstraint;
 import java.util.UUID;
 
 @Entity
-@Table(name = "reconciliation_records")
+@Table(
+    name = "reconciliation_records",
+    uniqueConstraints = {
+        @UniqueConstraint(name = "uk_reconciliation_records_event_id", columnNames = {"webhook_event_id"})
+    }
+)
 public class ReconciliationRecord {
 
     @Id

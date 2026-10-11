@@ -45,6 +45,28 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errorResponse);
     }
 
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleResourceNotFound(ResourceNotFoundException ex) {
+        log.warn("Resource not found: {}", ex.getMessage());
+        ErrorResponse errorResponse = new ErrorResponse(
+            HttpStatus.NOT_FOUND.value(),
+            "Not Found",
+            ex.getMessage()
+        );
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorResponse);
+    }
+
+    @ExceptionHandler(InvalidStateTransitionException.class)
+    public ResponseEntity<ErrorResponse> handleInvalidStateTransition(InvalidStateTransitionException ex) {
+        log.warn("Invalid state transition / Conflict: {}", ex.getMessage());
+        ErrorResponse errorResponse = new ErrorResponse(
+            HttpStatus.CONFLICT.value(),
+            "Conflict",
+            ex.getMessage()
+        );
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(errorResponse);
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<ErrorResponse> handleIllegalArgument(IllegalArgumentException ex) {
         log.warn("Illegal argument: {}", ex.getMessage());
@@ -54,6 +76,34 @@ public class GlobalExceptionHandler {
             ex.getMessage()
         );
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errorResponse);
+    }
+
+    @ExceptionHandler(RateLimitExceededException.class)
+    public ResponseEntity<ErrorResponse> handleRateLimitExceeded(RateLimitExceededException ex) {
+        log.warn("Rate limit exceeded for source: {}", ex.getSource());
+        ErrorResponse errorResponse = new ErrorResponse(
+            HttpStatus.TOO_MANY_REQUESTS.value(),
+            "Too Many Requests",
+            ex.getMessage()
+        );
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+            .header("Retry-After", String.valueOf(ex.getRetryAfterSeconds()))
+            .header("X-RateLimit-Limit", String.valueOf(ex.getLimit()))
+            .header("X-RateLimit-Remaining", "0")
+            .body(errorResponse);
+    }
+
+    @ExceptionHandler(RateLimiterUnavailableException.class)
+    public ResponseEntity<ErrorResponse> handleRateLimiterUnavailable(RateLimiterUnavailableException ex) {
+        log.error("Rate limiter service unavailable: {}", ex.getMessage());
+        ErrorResponse errorResponse = new ErrorResponse(
+            HttpStatus.SERVICE_UNAVAILABLE.value(),
+            "Service Unavailable",
+            "Rate limiting service is temporarily unavailable. Please retry later."
+        );
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+            .header("Retry-After", "30")
+            .body(errorResponse);
     }
 
     @ExceptionHandler(Exception.class)

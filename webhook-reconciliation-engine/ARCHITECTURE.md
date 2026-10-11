@@ -232,7 +232,7 @@ Return 202 Accepted (No direct broker publishing during HTTP ingestion)
 2. **Failure Handling Workflow in WebhookProcessingService**:
    - On processor failure, creates and persists a failed `WebhookAttempt` with error details, attempt number, and completion time.
    - If `attemptCount < maxAttempts`: updates `WebhookEvent` status to `RETRY_PENDING`, stores `lastError`, and persists `nextRetryAt`.
-   - If `attemptCount >= maxAttempts`: updates `WebhookEvent` status to `FAILED`, stores `lastError`, and leaves `nextRetryAt` as null.
+   - If `attemptCount >= maxAttempts`: updates `WebhookEvent` status to `DEAD_LETTER`, stores `lastError`, and leaves `nextRetryAt` as null.
 3. **WebhookRetryScheduler**:
    - Runs on scheduled intervals (`app.retry.scheduler-interval-ms: 1000`).
    - Queries `WebhookEventRepository.findDueEventsForRetry(...)` where `status = 'RETRY_PENDING'` and `nextRetryAt <= now()`, ordered by `nextRetryAt ASC` with pagination.
@@ -241,17 +241,180 @@ Return 202 Accepted (No direct broker publishing during HTTP ingestion)
    - Broker publication retries operate strictly at the transport level on `OutboxEvent` (`PENDING`).
    - Business processing retries operate on `WebhookEvent` (`RETRY_PENDING`) and `WebhookAttempt`. A RabbitMQ network outage does not prematurely increment business attempt counts.
 
+## Phase 6 Implementation — Dead-Letter Handling & Controlled Event Replay
+
+### Architectural Overview
+Application-level dead-letter handling manages exhausted processing failures without coupling failure state to message broker topology.
+
+```text
+Processing Failure (Attempt >= maxAttempts)
+   ↓
+WebhookProcessingService
+   ├── Mark WebhookAttempt as FAILED (completedAt, errorMessage)
+   ├── Set WebhookEvent status to DEAD_LETTER
+   ├── Clear nextRetryAt (null)
+   └── Preserve attemptCount, lastError, and historical attempts
+         ↓
+WebhookRetryScheduler ignores DEAD_LETTER events
+         ↓
+Operator Inspection & Replay API (/api/v1/dead-letters)
+   ├── GET /api/v1/dead-letters (Paginated summary)
+   ├── GET /api/v1/dead-letters/{id} (Detailed failure & attempt history)
+   └── POST /api/v1/dead-letters/{id}/replay (Controlled replay via Outbox)
+         ↓
+[Atomic Database Transaction]
+   ├── Claim Event: UPDATE status DEAD_LETTER -> RECEIVED (WHERE status = 'DEAD_LETTER')
+   ├── Audit Replay: Insert into webhook_replays (reason, previous_attempt_count, requested_at)
+   └── Transactional Outbox: Insert OutboxEvent (PENDING, payload = WebhookProcessingMessage)
+         ↓
+OutboxPublisher dispatches to RabbitMQ
+         ↓
+WebhookProcessingConsumer -> WebhookProcessingService executes Attempt N+1
+```
+
+### Components & Responsibilities
+1. **DeadLetterService**:
+   - Coordinates paginated listing of `DEAD_LETTER` events.
+   - Provides deep inspection returning `DeadLetterDetailResponse` with chronological attempt history from `webhook_attempts` and audit entries from `webhook_replays`.
+   - Executes atomic replay transactions via `claimEventForReplay` and outbox message creation.
+2. **DeadLetterController**:
+   - Exposes REST endpoints under `/api/v1/dead-letters` with OpenAPI documentation.
+   - Returns standard HTTP codes (`200 OK`, `202 Accepted`, `400 Bad Request`, `404 Not Found`, `409 Conflict`).
+3. **Database Schema & Audit Migration (V2)**:
+   - `idx_webhook_events_status_created_at` on `(status, created_at DESC)` for high-performance paginated dead-letter queries.
+   - `webhook_replays` audit table referencing `webhook_events(id)` tracking replay request timestamps, reasons, and previous attempt counts.
+4. **Concurrency Safety & Idempotent Replays**:
+   - Conditional SQL update `claimEventForReplay` acts as a distributed lock. If two operators or systems trigger replay concurrently, exactly one thread transitions the status and writes the outbox event; the second thread gets 0 updated rows and receives `409 Conflict`.
+5. **Attempt Continuity & Bounded Retry Limit**:
+   - Replay never resets `attemptCount` to zero or deletes prior `WebhookAttempt` records.
+   - The subsequent processing execution consumes attempt number `attemptCount + 1`.
+   - If the replayed execution fails, `canRetry(attemptCount + 1)` evaluates to `false` because the attempt count already exceeds `max-attempts`. The event transitions directly back to `DEAD_LETTER`, preventing automated infinite retry storms.
+
+## Security & Role-Based Access Control Architecture (Phase 7)
+
+### 1. Authentication & Operational Security
+- **Mechanism**: Spring Security with HTTP Basic authentication (`RestAuthenticationEntryPoint`) and completely stateless session management (`SessionCreationPolicy.STATELESS`).
+- **User Persistence**: Operational user accounts are stored in PostgreSQL table `security_users` (managed by Flyway migration `V3__create_security_users_table.sql`).
+- **Password Hashing**: Passwords are encrypted using BCrypt (`BCryptPasswordEncoder`). Plaintext passwords are never stored, logged, or returned in API responses.
+- **Error Consistency**:
+  - `RestAuthenticationEntryPoint` returns HTTP `401 Unauthorized` with `WWW-Authenticate` header and structured JSON `ErrorResponse`.
+  - `RestAccessDeniedHandler` returns HTTP `403 Forbidden` with structured JSON `ErrorResponse`.
+
+### 2. Role-Based Authorization Policy
+Authorization is enforced through the Spring Security filter chain and method-level security (`@PreAuthorize`):
+- `ADMIN`: List dead-letters, inspect dead-letters, replay dead-letters, and manage operational administration.
+- `OPERATOR`: List dead-letters, inspect dead-letters, replay dead-letters.
+- `VIEWER`: List dead-letters, inspect dead-letters. Forbidden (`403`) from triggering event replays.
+- `Public / Unauthenticated`: Public webhook ingestion (`POST /api/v1/webhooks`) and infrastructure health endpoints (`/actuator/health`). All other unlisted application endpoints require authentication by default.
+
+### 3. Bootstrap Administrator Lifecycle
+- Controlled via `APP_SECURITY_BOOTSTRAP_USERNAME` and `APP_SECURITY_BOOTSTRAP_PASSWORD`.
+- `BootstrapAdminService` implements `ApplicationRunner`:
+  - If configuration is absent or blank, bootstrapping is disabled.
+  - Checks `securityUserRepository.existsByUsername(username)`: if the admin already exists, bootstrapping skips without overwriting the existing password hash.
+  - Plaintext password is never logged.
+  - Environment variables are isolated in `.env` (git-ignored) with placeholders in `.env.example`.
+
+### 4. Public Webhook Trust Boundary
+- The webhook ingestion endpoint (`POST /api/v1/webhooks`) allows unauthenticated requests from external producers.
+- **Trust Boundary Note**: In this phase, the `source` field is client-provided in the payload and can be spoofed (cryptographic webhook signatures are not validated in Phase 7).
+- Ingestion is guarded against volumetric overload via Redis rate limiting.
+
+## Redis Rate Limiting Architecture (Phase 7)
+
+### 1. Atomic Fixed-Window Algorithm
+- Evaluates traffic per webhook `source` across multiple application instances using a shared Redis instance.
+- **Atomic Lua Script**:
+  ```lua
+  local key = KEYS[1]
+  local limit = tonumber(ARGV[1])
+  local expireSeconds = tonumber(ARGV[2])
+
+  local current = redis.call('INCR', key)
+  if current == 1 then
+      redis.call('EXPIRE', key, expireSeconds)
+  end
+  local ttl = redis.call('TTL', key)
+  if ttl == -1 then
+      redis.call('EXPIRE', key, expireSeconds)
+  end
+  return current
+  ```
+- **Atomicity Guarantee**: Redis executes Lua scripts in a single atomic thread. The `INCR` and conditional `EXPIRE` happen within the same atomic execution, preventing race conditions where keys could be created without TTL expiry.
+- **Epoch Partitioning**: Keys are partitioned by clock epoch window (`epochWindow = nowSeconds / windowSeconds`), guaranteeing immediate counter reset when window boundaries turn, and automatic eviction via TTL (`expireSeconds = windowSeconds * 2`).
+
+### 2. Bounded Key Strategy & Normalization
+- Redis Key: `app:ratelimit:src:<safeSource>:<epochWindow>`
+- Raw `source` values are trimmed and lowercased.
+- Safe alphanumeric values (`^[a-z0-9_-]{1,64}$`) are preserved.
+- Unbounded strings or values with special characters are converted to SHA-256 hex hashes (`hash_<sha256Hex>`), ensuring Redis keys are bounded and protected against key injection.
+- Null or blank values fallback safely to `"unknown"`.
+
+### 3. Rate Limit Behavior & Headers
+- **Under Limit**: Ingestion proceeds to transaction and outbox creation. Response contains `X-RateLimit-Limit` and `X-RateLimit-Remaining`.
+- **Exceeded Limit**: Request is rejected with HTTP `429 Too Many Requests`, headers `Retry-After: <secondsRemaining>`, `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`, and structured `ErrorResponse`.
+- **Transactional Safety**: Rejected requests abort before database interaction; no `WebhookEvent` or `OutboxEvent` records are created. Allowed duplicate requests preserve Phase 2 idempotency.
+
+### 4. Redis Outage Handling (Fail-Closed Default)
+- **Fail-Closed (Default)**: If Redis is unavailable or times out, the rate limiter throws `RateLimiterUnavailableException`. `GlobalExceptionHandler` converts this to HTTP `503 Service Unavailable` with `Retry-After: 30`. No internal Redis stack traces or keys are leaked to clients.
+- **Fail-Open (Configurable)**: If `app.rate-limit.fail-closed=false`, outages log a warning and allow traffic, prioritizing ingestion availability over enforcement.
+
+## Reconciliation Engine Architecture (Phase 8)
+
+### 1. Source-of-Truth Abstraction
+- **Interface**: `SourceOfTruthClient` with method `Optional<ExternalEventRecord> fetchExternalRecord(String source, String eventId) throws ExternalProviderException`.
+- **Deterministic Simulation (`SimulatedSourceOfTruthClient`)**:
+  - Independent of the reconciliation algorithm; provides reference data for local development and automated testing.
+  - Suffix patterns:
+    - `_notfound`: Simulates missing records in the external provider (`Optional.empty()`).
+    - `_mismatch`: Simulates status mismatch (`FAILED` vs `COMPLETED`).
+    - `_corrected`: Simulates external settlement with adjustment (`SETTLED_WITH_ADJUSTMENT`).
+    - `_error`: Simulates upstream network timeout / outage (`ExternalProviderException`).
+    - Default: Simulates matching reference state (`COMPLETED` / `PAID`).
+  - Supports programmatic test overrides via `registerRecord(source, eventId, record)` and `registerFailure(source, eventId, errorMessage)`.
+
+### 2. Event Eligibility Rules
+Reconciliation operates exclusively on terminal webhook events:
+- Internal status must be terminal: `COMPLETED`, `DEAD_LETTER`, or `FAILED`. In-flight events (`RECEIVED`, `PROCESSING`, `RETRY_PENDING`) are excluded from reconciliation until execution concludes.
+- By default, events that already possess an audit record in `reconciliation_records` are excluded from new batches.
+- Operators may set `includeAlreadyReconciled = true` to force re-evaluation of previously reconciled events.
+
+### 3. Comparison & Classification Rules
+Each event is evaluated independently and classified into one of four states:
+- `MATCHED`:
+  - Internal `COMPLETED` matches external `COMPLETED`, `PAID`, `SUCCEEDED`, `SUCCESS`, or `DELIVERED`.
+  - Internal `DEAD_LETTER` / `FAILED` matches external `FAILED`, `DEAD_LETTER`, `CANCELLED`, `REJECTED`, or `ERROR`.
+- `CORRECTED`:
+  - External status indicates a safe settlement or adjustment (`SETTLED_WITH_ADJUSTMENT`, `RESOLVED_EXTERNALLY`, `MANUALLY_SETTLED`).
+  - Safe audit detail is recorded in the JSON audit payload without mutating immutable webhook event history (`WebhookEvent.status` is preserved).
+- `MISMATCH`:
+  - Internal status contradicts external status (e.g. internal `COMPLETED` but external `FAILED`, or internal `DEAD_LETTER` but external `PAID`).
+  - External reference record is not found (`externalStatus = NOT_FOUND`).
+- `FAILED`:
+  - External provider throws `ExternalProviderException` (network timeout, rate limit, provider 5xx).
+  - Recorded as `FAILED` with provider error details; does not abort the remainder of the reconciliation batch.
+
+### 4. Reliability, Deduplication & Concurrency
+- **Bounded Batches**: Default batch size is 50, capped at 100 via `ReconciliationProperties`. Prevents unbounded table scans and memory exhaustion.
+- **Per-Event Transaction Isolation**: `reconcileSingleEvent` executes with `Propagation.REQUIRES_NEW`. A failure or provider outage on one event commits its `FAILED` audit record without rolling back or failing the remaining batch.
+- **Database Uniqueness Constraint**: Flyway `V4__create_reconciliation_indexes_and_constraints.sql` adds `uk_reconciliation_records_event_id` on `reconciliation_records(webhook_event_id)`.
+- **Race Condition Tolerance**: If concurrent runs evaluate the same event simultaneously, database constraints prevent duplicate records, and the losing thread catches `DataIntegrityViolationException` to fetch and return the existing record cleanly.
+
+### 5. API & Role-Based Security Matrix
+- `POST /api/v1/reconciliation/runs`: Restricted to `ADMIN` and `OPERATOR`. `VIEWER` is denied with `403 Forbidden`.
+- `GET /api/v1/reconciliation/records`: Accessible to `ADMIN`, `OPERATOR`, and `VIEWER`. Supports pagination and filtering by `result` and `source`.
+- `GET /api/v1/reconciliation/records/{id}`: Accessible to `ADMIN`, `OPERATOR`, and `VIEWER`. Returns detailed record with parsed JSON comparison audit.
+- Unauthenticated requests receive HTTP `401 Unauthorized`.
+
 ## Current Limitations
 
-- No Dead Letter Queue or replay endpoints (Phase 6)
-- No reconciliation logic against external APIs (Phase 6)
-- No Redis rate limiting or caching (Phase 3 in old numbering / Redis layer)
-- No webhook signature validation or security authentication (Phase 9)
-- No administrative UI (Phase 8)
+- Webhook provider signature verification (HMAC) is not implemented in this phase.
+- Automatic mutation of webhook history on `CORRECTED` is intentionally disallowed to preserve audit immutability.
+- Administrative web UI is planned for a later phase.
 
 ## Future Architecture
 
-The following capabilities are **planned** but not implemented:
+The following capabilities are planned:
 
 | Capability | Phase | Notes |
 |---|---|---|
@@ -260,10 +423,11 @@ The following capabilities are **planned** but not implemented:
 | RabbitMQ async processing | Phase 3 | Completed: Broker configuration, publisher, consumer, worker lifecycle |
 | Transactional Outbox Pattern | Phase 4 | Completed: Atomic DB write, scheduled outbox poller, publisher confirms |
 | Retry with exponential backoff | Phase 5 | Completed: Database-backed retries, backoff policy, retry scheduler |
-| DLQ & manual replay | Phase 6 | Dead-letter queue for exhausted events, manual replay endpoint |
-| Reconciliation engine | Phase 7 | External source-of-truth comparison |
-| Observability & metrics | Phase 8 | Micrometer, dashboards |
-| Admin dashboard | Phase 9 | Event browser, replay, monitoring |
-| Security hardening | Phase 10 | Rate limiting, API keys, HMAC |
+| DLQ & manual replay | Phase 6 | Completed: Dead-letter state, inspection API, outbox replay, audit trail |
+| Security & Redis Rate Limiting | Phase 7 | Completed: Basic Auth, RBAC matrix, admin bootstrap, Redis atomic rate limiter |
+| Reconciliation engine | Phase 8 | Completed: Source-of-truth abstraction, bounded runs, audit records, RBAC |
+| Observability & metrics | Phase 9 | Micrometer Prometheus, dashboards |
+| Performance & Production Readiness | Phase 10 | Benchmark, tuning, production checklist |
+
 
 

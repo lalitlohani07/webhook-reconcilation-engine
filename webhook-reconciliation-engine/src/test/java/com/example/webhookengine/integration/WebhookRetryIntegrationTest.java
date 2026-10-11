@@ -126,8 +126,8 @@ class WebhookRetryIntegrationTest {
     }
 
     @Test
-    @DisplayName("Exhausted retries workflow: sets FAILED status and scheduler does not pick it up")
-    void shouldExhaustRetriesAndSetFailedStatus() {
+    @DisplayName("Exhausted retries workflow: sets DEAD_LETTER status and scheduler does not pick it up")
+    void shouldExhaustRetriesAndSetDeadLetterStatus() {
         WebhookEvent event = new WebhookEvent("evt_exhausted", "stripe", "charge.failed", "{}", WebhookStatus.RECEIVED);
         event.setAttemptCount(2); // Initial attempt count 2; next will be 3 of 3 (maxAttempts = 3)
         WebhookEvent savedEvent = webhookEventRepository.saveAndFlush(event);
@@ -139,7 +139,7 @@ class WebhookRetryIntegrationTest {
             .isInstanceOf(RuntimeException.class);
 
         WebhookEvent afterFailure = webhookEventRepository.findById(savedEvent.getId()).orElseThrow();
-        assertThat(afterFailure.getStatus()).isEqualTo(WebhookStatus.FAILED);
+        assertThat(afterFailure.getStatus()).isEqualTo(WebhookStatus.DEAD_LETTER);
         assertThat(afterFailure.getAttemptCount()).isEqualTo(3);
         assertThat(afterFailure.getNextRetryAt()).isNull();
 

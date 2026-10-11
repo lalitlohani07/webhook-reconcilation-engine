@@ -156,9 +156,9 @@ class WebhookProcessingServiceTest {
             .isInstanceOf(RuntimeException.class)
             .hasMessage("Permanent bad data");
 
-        // Attempt count incremented to 3 (failed execution 3 >= maxAttempts 3) -> FAILED
+        // Attempt count incremented to 3 (failed execution 3 >= maxAttempts 3) -> DEAD_LETTER
         assertThat(event.getAttemptCount()).isEqualTo(3);
-        assertThat(event.getStatus()).isEqualTo(WebhookStatus.FAILED);
+        assertThat(event.getStatus()).isEqualTo(WebhookStatus.DEAD_LETTER);
         assertThat(event.getNextRetryAt()).isNull();
         assertThat(event.getLastError()).isEqualTo("Permanent bad data");
 

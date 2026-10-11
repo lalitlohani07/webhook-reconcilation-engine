@@ -126,9 +126,9 @@ public class WebhookProcessingService {
                 log.info("Scheduled retry for webhook event: internalId={}, eventId={}, failedAttempt={}, nextRetryAt={}",
                     event.getId(), event.getEventId(), nextAttemptNumber, nextRetry);
             } else {
-                event.setStatus(WebhookStatus.FAILED);
+                event.setStatus(WebhookStatus.DEAD_LETTER);
                 event.setNextRetryAt(null);
-                log.warn("Exhausted maximum retry attempts ({}) for webhook event: internalId={}, eventId={}. Marked as FAILED.",
+                log.warn("Exhausted maximum retry attempts ({}) for webhook event: internalId={}, eventId={}. Moved to DEAD_LETTER.",
                     retryPolicy.getProperties().getMaxAttempts(), event.getId(), event.getEventId());
             }
 

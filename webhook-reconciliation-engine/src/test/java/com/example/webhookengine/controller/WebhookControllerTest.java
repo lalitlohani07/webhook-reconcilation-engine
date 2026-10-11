@@ -4,9 +4,17 @@ import com.example.webhookengine.controller.dto.WebhookIngestRequest;
 import com.example.webhookengine.domain.WebhookEvent;
 import com.example.webhookengine.domain.WebhookStatus;
 import com.example.webhookengine.exception.GlobalExceptionHandler;
+import com.example.webhookengine.exception.RateLimiterUnavailableException;
+import com.example.webhookengine.ratelimit.dto.RateLimitResult;
+import com.example.webhookengine.ratelimit.service.RateLimiterService;
+import com.example.webhookengine.security.config.SecurityConfig;
+import com.example.webhookengine.security.handler.RestAccessDeniedHandler;
+import com.example.webhookengine.security.handler.RestAuthenticationEntryPoint;
+import com.example.webhookengine.security.service.CustomUserDetailsService;
 import com.example.webhookengine.service.IngestionResult;
 import com.example.webhookengine.service.WebhookIngestionService;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -17,13 +25,22 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(WebhookController.class)
-@Import(GlobalExceptionHandler.class)
+@Import({
+    SecurityConfig.class,
+    RestAuthenticationEntryPoint.class,
+    RestAccessDeniedHandler.class,
+    GlobalExceptionHandler.class
+})
 class WebhookControllerTest {
 
     @Autowired
@@ -35,8 +52,19 @@ class WebhookControllerTest {
     @MockitoBean
     private WebhookIngestionService webhookIngestionService;
 
+    @MockitoBean
+    private RateLimiterService rateLimiterService;
+
+    @MockitoBean
+    private CustomUserDetailsService userDetailsService;
+
+    @BeforeEach
+    void setUp() {
+        when(rateLimiterService.tryAcquire(any())).thenReturn(RateLimitResult.allowed(60, 59));
+    }
+
     @Test
-    @DisplayName("POST /api/v1/webhooks returns 202 Accepted for new event")
+    @DisplayName("POST /api/v1/webhooks returns 202 Accepted with rate-limit headers for new event")
     void shouldReturn202AcceptedForNewEvent() throws Exception {
         WebhookEvent savedEvent = new WebhookEvent("evt_001", "stripe", "payment.succeeded", "{\"amount\": 1000}", WebhookStatus.RECEIVED);
         when(webhookIngestionService.ingestWebhook(any(WebhookIngestRequest.class)))
@@ -55,6 +83,8 @@ class WebhookControllerTest {
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(requestJson))
             .andExpect(status().isAccepted())
+            .andExpect(header().string("X-RateLimit-Limit", "60"))
+            .andExpect(header().string("X-RateLimit-Remaining", "59"))
             .andExpect(jsonPath("$.eventId").value("evt_001"))
             .andExpect(jsonPath("$.source").value("stripe"))
             .andExpect(jsonPath("$.status").value("RECEIVED"))
@@ -62,7 +92,7 @@ class WebhookControllerTest {
     }
 
     @Test
-    @DisplayName("POST /api/v1/webhooks returns 200 OK for duplicate event with existing status")
+    @DisplayName("POST /api/v1/webhooks returns 200 OK with rate-limit headers for duplicate event with existing status")
     void shouldReturn200OkForDuplicateEvent() throws Exception {
         WebhookEvent existingEvent = new WebhookEvent("evt_001", "stripe", "payment.succeeded", "{\"amount\": 1000}", WebhookStatus.PROCESSING);
         when(webhookIngestionService.ingestWebhook(any(WebhookIngestRequest.class)))
@@ -81,10 +111,68 @@ class WebhookControllerTest {
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(requestJson))
             .andExpect(status().isOk())
+            .andExpect(header().string("X-RateLimit-Limit", "60"))
+            .andExpect(header().string("X-RateLimit-Remaining", "59"))
             .andExpect(jsonPath("$.eventId").value("evt_001"))
             .andExpect(jsonPath("$.source").value("stripe"))
             .andExpect(jsonPath("$.status").value("PROCESSING"))
             .andExpect(jsonPath("$.message").value("Webhook event already received"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/webhooks returns 429 Too Many Requests when rate limit is exceeded")
+    void shouldReturn429WhenRateLimitExceeded() throws Exception {
+        when(rateLimiterService.tryAcquire(eq("stripe")))
+            .thenReturn(RateLimitResult.denied(60, 45));
+
+        String requestJson = """
+            {
+                "eventId": "evt_overlimit",
+                "source": "stripe",
+                "eventType": "payment.succeeded",
+                "payload": {"amount": 1000}
+            }
+            """;
+
+        mockMvc.perform(post("/api/v1/webhooks")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(requestJson))
+            .andExpect(status().isTooManyRequests())
+            .andExpect(header().string("Retry-After", "45"))
+            .andExpect(header().string("X-RateLimit-Limit", "60"))
+            .andExpect(header().string("X-RateLimit-Remaining", "0"))
+            .andExpect(jsonPath("$.status").value(429))
+            .andExpect(jsonPath("$.error").value("Too Many Requests"))
+            .andExpect(jsonPath("$.message").value("Rate limit exceeded for source 'stripe'. Please retry after 45 seconds."));
+
+        verify(webhookIngestionService, never()).ingestWebhook(any());
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/webhooks returns 503 Service Unavailable when rate limiter fails closed")
+    void shouldReturn503WhenRateLimiterFailsClosed() throws Exception {
+        when(rateLimiterService.tryAcquire(eq("stripe")))
+            .thenThrow(new RateLimiterUnavailableException("Redis connection refused"));
+
+        String requestJson = """
+            {
+                "eventId": "evt_failclosed",
+                "source": "stripe",
+                "eventType": "payment.succeeded",
+                "payload": {"amount": 1000}
+            }
+            """;
+
+        mockMvc.perform(post("/api/v1/webhooks")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(requestJson))
+            .andExpect(status().isServiceUnavailable())
+            .andExpect(header().string("Retry-After", "30"))
+            .andExpect(jsonPath("$.status").value(503))
+            .andExpect(jsonPath("$.error").value("Service Unavailable"))
+            .andExpect(jsonPath("$.message").value("Rate limiting service is temporarily unavailable. Please retry later."));
+
+        verify(webhookIngestionService, never()).ingestWebhook(any());
     }
 
     @Test
