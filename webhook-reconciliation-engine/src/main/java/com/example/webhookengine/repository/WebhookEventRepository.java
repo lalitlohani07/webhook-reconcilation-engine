@@ -13,6 +13,10 @@ import java.util.UUID;
 @Repository
 public interface WebhookEventRepository extends JpaRepository<WebhookEvent, UUID> {
 
+    @org.springframework.data.jpa.repository.Lock(jakarta.persistence.LockModeType.PESSIMISTIC_WRITE)
+    @org.springframework.data.jpa.repository.Query("SELECT w FROM WebhookEvent w WHERE w.id = :id")
+    Optional<WebhookEvent> findByIdForUpdate(@org.springframework.data.repository.query.Param("id") UUID id);
+
     Optional<WebhookEvent> findBySourceAndEventId(String source, String eventId);
 
     List<WebhookEvent> findByStatus(WebhookStatus status);

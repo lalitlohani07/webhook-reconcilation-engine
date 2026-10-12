@@ -169,8 +169,25 @@ public class ReconciliationServiceImpl implements ReconciliationService {
         );
     }
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.springframework.transaction.PlatformTransactionManager transactionManager;
+
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public ReconciliationRecord reconcileSingleEvent(WebhookEvent event, boolean allowUpdate) {
+        if (transactionManager != null && !org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive()) {
+            org.springframework.transaction.support.TransactionTemplate tt =
+                new org.springframework.transaction.support.TransactionTemplate(transactionManager);
+            tt.setPropagationBehavior(org.springframework.transaction.TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+            return tt.execute(status -> doReconcileSingleEvent(event, allowUpdate));
+        }
+        return doReconcileSingleEvent(event, allowUpdate);
+    }
+
+    private ReconciliationRecord doReconcileSingleEvent(WebhookEvent event, boolean allowUpdate) {
+        // Atomically lock the WebhookEvent to synchronize concurrent reconciliation runs for the same event
+        if (event != null && event.getId() != null && org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive()) {
+            webhookEventRepository.findByIdForUpdate(event.getId());
+        }
         Optional<ReconciliationRecord> existingOpt = reconciliationRecordRepository.findByWebhookEvent(event);
         if (existingOpt.isPresent() && !allowUpdate) {
             log.debug("Event {} already reconciled; skipping reprocessing", event.getEventId());

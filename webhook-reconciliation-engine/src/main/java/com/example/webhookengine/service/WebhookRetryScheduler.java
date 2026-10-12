@@ -35,6 +35,9 @@ public class WebhookRetryScheduler {
     private final OutboxEventRepository outboxEventRepository;
     private final ObjectMapper objectMapper;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.springframework.transaction.PlatformTransactionManager transactionManager;
+
     @Value("${app.retry.batch-size:20}")
     private int batchSize = 20;
 
@@ -66,7 +69,12 @@ public class WebhookRetryScheduler {
 
         for (WebhookEvent event : dueEvents) {
             try {
-                claimAndEnqueueRetry(event);
+                if (transactionManager != null) {
+                    new org.springframework.transaction.support.TransactionTemplate(transactionManager)
+                        .execute(status -> claimAndEnqueueRetry(event));
+                } else {
+                    claimAndEnqueueRetry(event);
+                }
             } catch (Exception e) {
                 log.error("Failed to claim and re-enqueue retry for webhook event internalId={}: {}",
                     event.getId(), e.getMessage(), e);

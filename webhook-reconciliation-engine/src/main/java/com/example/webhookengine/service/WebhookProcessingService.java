@@ -38,14 +38,16 @@ public class WebhookProcessingService {
      * Executes asynchronous processing for a webhook event referenced by its internal ID.
      * Guaranteed idempotent across redeliveries and concurrent claims.
      */
-    @Transactional
+    @Transactional(noRollbackFor = Exception.class)
     public void processEventById(UUID webhookEventId) {
         if (webhookEventId == null) {
             log.warn("Received processing request with null webhookEventId. Discarding.");
             return;
         }
 
-        Optional<WebhookEvent> eventOpt = webhookEventRepository.findById(webhookEventId);
+        // Atomically claim and lock event with pessimistic write lock (falls back to findById if not mocked)
+        Optional<WebhookEvent> eventOpt = webhookEventRepository.findByIdForUpdate(webhookEventId)
+            .or(() -> webhookEventRepository.findById(webhookEventId));
         if (eventOpt.isEmpty()) {
             log.warn("Webhook event not found in database for internalId={}. Message will be acknowledged.", webhookEventId);
             return;
@@ -60,10 +62,10 @@ public class WebhookProcessingService {
             return;
         }
 
-        // 2. Guard against concurrent active processing
-        if (event.getStatus() == WebhookStatus.PROCESSING) {
-            log.info("Webhook event is already in PROCESSING status for internalId={}, eventId={}. Skipping concurrent execution.",
-                event.getId(), event.getEventId());
+        // 2. Guard against concurrent active processing or non-processable states
+        if (event.getStatus() != WebhookStatus.RECEIVED) {
+            log.info("Webhook event is in {} status for internalId={}, eventId={}. Skipping processing.",
+                event.getStatus(), event.getId(), event.getEventId());
             return;
         }
 

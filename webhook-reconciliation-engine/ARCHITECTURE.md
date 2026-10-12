@@ -1,433 +1,450 @@
-# Architecture — Webhook Reconciliation Engine
+# Technical Architecture — Webhook Reconciliation Engine
 
-## Project Purpose
+## 1. System Purpose & Architectural Style
 
-The Webhook Reconciliation Engine is a backend platform that reliably receives, validates, persists, and processes webhook events from external services. It reconciles internal state against external sources of truth and provides full observability into the processing pipeline.
+The **Webhook Reconciliation Engine** is an event-driven Java backend platform engineered to reliably receive, persist, process, and reconcile webhook events emitted by external distributed systems.
 
-## Architectural Style
-
-The project follows a **layered architecture** with clear separation of concerns:
-
-- **Controller Layer** — Handles HTTP requests and responses
-- **Service Layer** — Contains business logic
-- **Repository Layer** — Manages data persistence
-- **Messaging Layer** — Handles asynchronous message processing via RabbitMQ
-- **Domain Layer** — Defines core business entities
-
-This architecture was chosen for its simplicity and because the system's complexity does not yet warrant event sourcing, CQRS, or hexagonal architecture. The layered approach can be refactored incrementally if needed.
-
-## Package Structure
+### Layered Architecture
+The application adheres to a clean **layered architecture** with unidirectional dependencies:
 
 ```
-com.example.webhookengine/
-├── controller/         # REST API endpoints
-├── service/            # Business logic and orchestration
-├── repository/         # Data access (Spring Data JDBC)
-├── domain/             # Domain entities and value objects
-├── messaging/          # RabbitMQ producers and consumers
-├── reconciliation/     # Reconciliation logic
-├── security/           # Webhook authentication, signature validation
-├── exception/          # Custom exceptions, global error handlers
-├── config/             # Spring configuration classes
-└── common/             # Shared utilities and constants
+┌─────────────────────────────────────────────────────────────┐
+│                       Controller Layer                      │
+│   (REST Controllers, DTO Validation, Rate Limiter Check)    │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────┐
+│                        Service Layer                        │
+│   (Business Orchestration, Retry Engine, DLQ, Reconciliation│
+└──────────────┬──────────────────────────────┬───────────────┘
+               │                              │
+┌──────────────▼──────────────┐┌──────────────▼───────────────┐
+│       Messaging Layer       ││       Repository Layer       │
+│(RabbitMQ Publishers/Consumer││ (Spring Data JPA, Row Locks) │
+└──────────────┬──────────────┘└──────────────┬───────────────┘
+               │                              │
+┌──────────────▼──────────────┐┌──────────────▼───────────────┐
+│     RabbitMQ Message Broker ││     PostgreSQL 16 Database   │
+└─────────────────────────────┘└──────────────────────────────┘
 ```
 
-## Infrastructure Components
+1. **Controller Layer**: Handles HTTP ingress, validates request DTOs (`@Valid`), executes pre-flight Redis rate limit checks, and translates domain exceptions into standard HTTP error responses.
+2. **Service Layer**: Orchestrates domain business logic, state transitions, transaction management, backoff calculations, replay claims, and reconciliation comparisons.
+3. **Repository Layer**: Encapsulates persistence operations against PostgreSQL using Spring Data JPA, enforcing explicit concurrency controls via pessimistic row locks (`@Lock(LockModeType.PESSIMISTIC_WRITE)`).
+4. **Messaging Layer**: Implements AMQP publishing and consumption with RabbitMQ using correlated publisher confirms and JSON serialization.
+5. **Domain Layer**: Encapsulates core business entities, status enums, and JPA mappings.
 
-### PostgreSQL — Primary Database
+---
 
-**Status: CURRENTLY IMPLEMENTED (connection only)**
+## 2. Domain Model & Entity Relationships
 
-PostgreSQL is the primary relational database. It was chosen because:
+The data model is partitioned into distinct audit trails for domain events, worker attempts, outbox publications, operator replays, reconciliation records, and operational accounts.
 
-- ACID compliance is critical for webhook event persistence — we cannot lose or duplicate events
-- Strong support for JSON/JSONB columns for storing arbitrary webhook payloads
-- Mature ecosystem with excellent JDBC driver and Spring Data support
-- Flyway provides reliable, version-controlled schema migrations
-- Well-suited for the transactional consistency requirements of reconciliation
+```mermaid
+erDiagram
+    WEBHOOK_EVENT ||--o{ WEBHOOK_ATTEMPT : "has attempts"
+    WEBHOOK_EVENT ||--o{ OUTBOX_EVENT : "emits"
+    WEBHOOK_EVENT ||--o{ WEBHOOK_REPLAY : "replayed via"
+    WEBHOOK_EVENT ||--o| RECONCILIATION_RECORD : "reconciled in"
 
-Currently, the database connection is configured and Flyway is enabled, but no application tables have been created.
+    WEBHOOK_EVENT {
+        uuid id PK
+        varchar source
+        varchar event_id
+        varchar event_type
+        varchar status
+        int attempt_count
+        timestamp next_retry_at
+        text last_error
+        jsonb payload
+        timestamp created_at
+        timestamp updated_at
+        timestamp processed_at
+    }
 
-### RabbitMQ — Message Broker
+    WEBHOOK_ATTEMPT {
+        uuid id PK
+        uuid webhook_event_id FK
+        int attempt_number
+        varchar status
+        text error_message
+        timestamp started_at
+        timestamp completed_at
+    }
 
-**Status: CURRENTLY IMPLEMENTED (connection only)**
+    OUTBOX_EVENT {
+        uuid id PK
+        uuid aggregate_id
+        varchar event_type
+        varchar status
+        jsonb payload
+        int retry_count
+        text last_error
+        timestamp created_at
+        timestamp published_at
+    }
 
-RabbitMQ handles asynchronous event processing. It was chosen because:
+    WEBHOOK_REPLAY {
+        uuid id PK
+        uuid webhook_event_id FK
+        varchar reason
+        int previous_attempt_count
+        timestamp requested_at
+    }
 
-- Native support for acknowledgments, dead letter exchanges, and message TTL
-- Built-in retry semantics with dead letter queues
-- Supports multiple exchange types (direct, topic, fanout) for flexible routing
-- Management UI for operational visibility
-- Spring AMQP provides mature integration
+    RECONCILIATION_RECORD {
+        uuid id PK
+        uuid webhook_event_id FK
+        varchar event_id
+        varchar source
+        varchar event_type
+        varchar event_status
+        varchar result
+        text discrepancy_reason
+        jsonb details
+        timestamp reconciled_at
+    }
 
-Currently, the RabbitMQ connection is configured but no queues, exchanges, or consumers are defined.
-
-### Redis — Cache and Distributed State
-
-**Status: CURRENTLY IMPLEMENTED (connection only)**
-
-Redis provides caching and distributed state management. It was chosen because:
-
-- Sub-millisecond lookups for idempotency key checking
-- Atomic operations (SET NX, EXPIRE) for distributed locking
-- TTL-based key expiration aligns well with idempotency windows
-- Simple key-value model fits the caching use cases
-
-Currently, the Redis connection is configured but no application-level caching or state management is implemented.
-
-## Asynchronous Processing
-
-**Status: PLANNED**
-
-Webhook events will be processed asynchronously to:
-
-- Decouple webhook reception from processing, ensuring fast HTTP responses
-- Enable independent scaling of reception and processing
-- Provide natural retry semantics via message redelivery
-- Prevent processing failures from blocking new webhook reception
-
-## Current Implementation (Phase 0)
-
-What is currently in place:
-
-- [x] Spring Boot application skeleton
-- [x] PostgreSQL connection with HikariCP connection pool
-- [x] RabbitMQ connection via Spring AMQP
-- [x] Redis connection via Spring Data Redis
-- [x] Flyway configured (no migrations yet)
-- [x] Spring Actuator with health checks for all infrastructure
-- [x] OpenAPI/Swagger documentation infrastructure
-- [x] Graceful shutdown configuration
-- [x] Docker Compose for local infrastructure
-- [x] Multi-stage Dockerfile for application containerization
-- [x] Testcontainers integration for testing
-- [x] Structured logging configuration
-
-## Phase 1 Implementation — Domain Model & Database Schema
-
-### Entities & Relationships
-1. **WebhookEvent**:
-   - Primary domain entity representing received incoming webhooks.
-   - Identifier: UUID `id` (primary key). External `eventId` is kept separate.
-   - Composite unique constraint: `UNIQUE(source, event_id)`. Different providers (e.g., Stripe and GitHub) may produce identical event IDs (`evt_123`), which is safely allowed, while preventing duplicates from the same source.
-   - Status: `WebhookStatus` enum (`RECEIVED`, `PROCESSING`, `COMPLETED`, `RETRY_PENDING`, `FAILED`, `DEAD_LETTER`), persisted as `VARCHAR(50)` strings (avoiding native PostgreSQL ENUM fragility).
-   - Payload: JSON/JSONB-compatible storage using Hibernate `@JdbcTypeCode(SqlTypes.JSON)`.
-   - Timestamps: `Instant` stored as `TIMESTAMP WITH TIME ZONE` (UTC).
-
-2. **WebhookAttempt**:
-   - Tracks individual delivery and processing execution attempts for an event (`1:N` from `WebhookEvent`).
-   - Unique constraint: `UNIQUE(webhook_event_id, attempt_number)`.
-   - Preserves attempt start/completion timestamps and error messages without duplicating payload data.
-   - Foreign key to `webhook_events(id)` without cascading deletes to maintain historical auditability.
-
-3. **OutboxEvent**:
-   - Represents transactional outbox records for reliable event publication to RabbitMQ.
-   - Fields: `id` (UUID), `aggregateId`, `eventType`, `payload` (JSONB), `status` (`PENDING`, `PUBLISHED`, `FAILED`), timestamps, retry count, and last error.
-   - Prepared for the **Transactional Outbox Pattern**: In Phase 4, domain state mutations and outgoing broker events are committed in the same database transaction, eliminating dual-write failure modes between the database and RabbitMQ.
-
-4. **ReconciliationRecord**:
-   - Captures verification and reconciliation results comparing internal state with the external source of truth.
-   - Fields: `id` (UUID), `webhookEvent` (foreign key), `externalStatus`, `internalStatus`, `result` (`MATCHED`, `CORRECTED`, `MISMATCH`, `FAILED`), `reconciledAt`, and `details` (JSONB).
-
-### Database Responsibility & Schema Ownership
-- **Flyway owns schema creation**: Schema migrations are strictly managed through versioned SQL scripts in `src/main/resources/db/migration/` (`V1__create_webhook_domain_tables.sql`).
-- **JPA/Hibernate validation**: Configured with `spring.jpa.hibernate.ddl-auto: validate`. Hibernate validates entity mappings against the database schema at application startup without creating, altering, or dropping tables in production.
-- **Why JPA/Hibernate is used**: Provides standard object-relational mapping, lifecycle callbacks (`@PrePersist`, `@PreUpdate`), transactional repository support, and clean relationship navigation between events, attempts, and reconciliation records.
-
-### Timestamps & JSONB
-- **Timestamps**: All timestamps use Java `Instant` mapped to PostgreSQL `TIMESTAMP WITH TIME ZONE` to guarantee timezone-independent UTC persistence.
-- **JSONB**: Payloads and details are mapped as string-based JSONB via `@JdbcTypeCode(SqlTypes.JSON)` and `columnDefinition = "jsonb"`, providing native PostgreSQL JSON indexing and query capabilities without complex custom serializers.
-
-## Phase 2 Implementation — Webhook Ingestion API & Idempotency
-
-### Layered Flow
-```text
-HTTP Client
-   ↓ POST /api/v1/webhooks
-WebhookController (Validation, DTO mapping)
-   ↓ WebhookIngestRequest
-WebhookIngestionService (Idempotency logic, concurrency fallback)
-   ↓ findBySourceAndEventId / saveAndFlush
-WebhookEventRepository (PostgreSQL / Flyway Schema)
+    SECURITY_USER {
+        uuid id PK
+        varchar username UK
+        varchar password_hash
+        varchar role
+        boolean enabled
+        timestamp created_at
+    }
 ```
 
-### Idempotency and Concurrency Strategy
-- **Sequential Ingestion**: Checks `findBySourceAndEventId(source, eventId)`. If present, returns `200 OK` with existing status. If absent, persists the event with status `RECEIVED` and returns `202 Accepted`.
-- **Concurrent Ingestion**: When two concurrent threads simultaneously evaluate `findBySourceAndEventId` and neither sees an existing record, both attempt `saveAndFlush`. The database uniqueness constraint `UNIQUE(source, event_id)` rejects the duplicate with `DataIntegrityViolationException`. The service catches this exception and retrieves the safely persisted record, guaranteeing that exactly one record exists.
-- **Payload & State Preservation**: Duplicates never overwrite existing payloads, statuses, attempt counts, or timestamps.
+### Relational Schema Guarantees
+- **Composite Uniqueness on Ingestion**: `UNIQUE(source, event_id)` on `webhook_events`. Providers like Stripe and Shopify may generate identical strings (`evt_123`), but collisions within the same source are rejected.
+- **Strict Attempt Numbering**: `UNIQUE(webhook_event_id, attempt_number)` on `webhook_attempts`. Guarantees chronological non-overlapping attempt logs.
+- **Reconciliation Audit Uniqueness**: `UNIQUE(webhook_event_id)` on `reconciliation_records` (via Flyway `V4`) to prevent duplicate audits for a single event.
 
-## Phase 3 Implementation — RabbitMQ & Asynchronous Worker
+---
 
-### Processing Pipeline
-```text
-HTTP Client
-   ↓ POST /api/v1/webhooks
-WebhookController (Validation)
-   ↓
-WebhookIngestionService (Idempotent persistence in PostgreSQL)
-   ↓ saveAndFlush (status: RECEIVED)
-WebhookEventPublisher
-   ↓ convertAndSend (exchange: webhook.events, routingKey: webhook.received)
-RabbitMQ Queue: webhook.processing
-   ↓ @RabbitListener
-WebhookProcessingConsumer
-   ↓ processEventById(internalUUID)
-WebhookProcessingService (Authoritative DB check & state claim)
-   ↓ load from PostgreSQL
-   ├── Check status: if COMPLETED or PROCESSING -> skip duplicate
-   ├── Update status: PROCESSING, attemptCount + 1
-   ├── Persist WebhookAttempt (status: PROCESSING)
-   ├── WebhookEventProcessor.processEvent(event)
-   └── Update status: COMPLETED, processedAt = now(), WebhookAttempt = COMPLETED
+## 3. Detailed Request and Processing Flows
+
+### Flow 1: Webhook Ingestion & Idempotency
+
+External producers submit webhooks to `POST /api/v1/webhooks`. Ingestion requires fast acceptance, protection against volumetric overload, and bulletproof deduplication.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as HTTP Webhook Client
+    participant Ctrl as WebhookController
+    participant Limiter as RedisRateLimiter
+    participant Svc as WebhookIngestionService
+    participant DB as PostgreSQL 16
+
+    Client->>Ctrl: POST /api/v1/webhooks {source, eventId, payload}
+    Ctrl->>Limiter: tryAcquire(source) via Redis Lua script
+    alt Rate Limit Exceeded
+        Limiter-->>Ctrl: rejected (remaining = 0, retryAfter)
+        Ctrl-->>Client: 429 Too Many Requests (No DB transaction)
+    else Rate Limit OK
+        Limiter-->>Ctrl: allowed (limit, remaining)
+        Ctrl->>Svc: ingestWebhook(request)
+        Svc->>DB: findBySourceAndEventId(source, eventId)
+        alt Event Already Exists (Duplicate)
+            DB-->>Svc: existing WebhookEvent
+            Svc-->>Ctrl: IngestionResult (isNew = false)
+            Ctrl-->>Client: 200 OK {"status": "...", "message": "already received"}
+        else Event is New
+            DB-->>Svc: empty
+            Svc->>DB: Single ACID Transaction:<br/>1. save WebhookEvent (status: RECEIVED)<br/>2. save OutboxEvent (status: PENDING)
+            DB-->>Svc: committed
+            Svc-->>Ctrl: IngestionResult (isNew = true)
+            Ctrl-->>Client: 202 Accepted {"status": "RECEIVED", "message": "accepted"}
+        end
+    end
 ```
 
-### Components & Responsibilities
-1. **RabbitMqConfig**: Declares durable `webhook.events` DirectExchange, durable `webhook.processing` Queue, binding with routing key `webhook.received`, JSON message converter, publisher confirms, and returns callbacks.
-2. **WebhookEventPublisher**: Constructs lightweight `WebhookProcessingMessage` (containing only internal `webhookEventId`, external `eventId`, `source`, `eventType`) and publishes to RabbitMQ upon new event acceptance.
-3. **WebhookProcessingConsumer**: Listens to `webhook.processing`, unmarshals `WebhookProcessingMessage`, and delegates to service layer.
-4. **WebhookProcessingService**: Orchestrates database claim, attempt tracking, status transitions (`RECEIVED → PROCESSING → COMPLETED`), and handles failures (`FAILED`).
-5. **WebhookEventProcessor**: Deterministic business logic component separated from messaging listeners.
+#### Race Condition Handling on Ingestion
+If two identical webhooks arrive simultaneously, both might execute `findBySourceAndEventId` before either has committed. Both attempt `saveAndFlush`. The PostgreSQL unique index `UNIQUE(source, event_id)` rejects the second thread with `DataIntegrityViolationException`. `WebhookIngestionService` catches this violation, re-queries the row persisted by the winner, and returns `200 OK`, preserving strict idempotency.
 
-### Duplicate Message Delivery & Concurrency Safety
-- **Authoritative Database State**: PostgreSQL remains the single source of truth.
-- **Idempotent Consumption**: When duplicate messages arrive, the consumer inspects `WebhookEvent.getStatus()`. If `COMPLETED`, it acknowledges the message without reprocessing. If `PROCESSING`, concurrent execution is avoided.
-## Phase 4 Implementation — Transactional Outbox Pattern
- 
-### Transactional Ingestion & Outbox Persistence
-To eliminate the dual-write race condition between PostgreSQL and RabbitMQ, incoming webhooks persist both the domain record and the outbox event atomically:
-```text
-HTTP Client
-   ↓ POST /api/v1/webhooks
-WebhookController
-   ↓
-WebhookIngestionService.ingestWebhook
-   ↓
-persistEventAndOutbox [SINGLE @Transactional POSTGRESQL BOUNDARY]
-   ├── webhookEventRepository.saveAndFlush(WebhookEvent: RECEIVED)
-   └── outboxEventRepository.saveAndFlush(OutboxEvent: PENDING)
-   ↓
-Return 202 Accepted (No direct broker publishing during HTTP ingestion)
+---
+
+### Flow 2: Transactional Outbox & Correlated RabbitMQ Publication
+
+Directly publishing to RabbitMQ during the HTTP request introduces dual-write failures (DB commit succeeds, broker publish fails $\rightarrow$ event lost; or publish succeeds, DB commit fails $\rightarrow$ phantom message). The Transactional Outbox pattern eliminates this vulnerability.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Poller as OutboxPublisher (@Scheduled)
+    participant DB as PostgreSQL 16
+    participant Pub as WebhookEventPublisher
+    participant Broker as RabbitMQ (Exchange: webhook.events)
+
+    loop Polling Interval (e.g. 2000ms)
+        Poller->>DB: findPendingEventsForProcessing(status=PENDING, batchSize=10)
+        DB-->>Poller: List<OutboxEvent>
+        loop For Each OutboxEvent
+            Poller->>DB: Re-read status (Guard against concurrent pollers)
+            alt Status is still PENDING
+                Poller->>Pub: publishEvent(outboxEvent)
+                Pub->>Broker: convertAndSend(exchange, routingKey, payload) with CorrelationData
+                Broker-->>Pub: Publisher Confirm (ACK / NACK) within timeout (5s)
+                alt Confirm ACK
+                    Pub-->>Poller: success
+                    Poller->>DB: UPDATE outbox_events SET status='PUBLISHED', published_at=now()
+                else Confirm NACK or Timeout
+                    Pub-->>Poller: failure
+                    Poller->>DB: UPDATE outbox_events SET retry_count=retry_count+1, last_error=...
+                end
+            else Status != PENDING
+                Poller-->>Poller: Skip duplicate publication
+            end
+        end
+    end
 ```
 
-### Outbox Publisher Poller
-1. **Scheduled Polling**: `OutboxPublisher` runs at configurable intervals (`app.outbox.poll-interval-ms: 1000`) with batching (`app.outbox.batch-size: 10`).
-2. **Deterministic FIFO Ordering**: `findPendingEventsForProcessing` queries `status = 'PENDING'` ordered by `createdAt ASC` using `Pageable`.
-3. **Publisher Confirmation & Returns**:
-   - `WebhookEventPublisher` utilizes RabbitMQ correlation futures (`correlationData.getFuture().get(5, SECONDS)`).
-   - If broker returns ACK without return warning, `outboxEvent.markPublished()` is committed (`status = PUBLISHED`, `publishedAt = Instant.now()`).
-   - If broker returns NACK, unroutable message, or times out, the outbox record remains `PENDING` with `retryCount` incremented and `lastError` recorded for automatic redelivery on the next poller cycle.
-4. **Resilience & Fault Tolerance**:
-   - **PostgreSQL Failure**: Neither `WebhookEvent` nor `OutboxEvent` is committed (tested via transaction rollback).
-   - **RabbitMQ Downtime**: Ingestion continues uninterrupted with `202 Accepted`. Outbox records accumulate as `PENDING` and are published seamlessly once RabbitMQ recovers.
-   - **Application Crash**: Unsent `PENDING` events are picked up by the publisher upon restart.
-   - **At-Least-Once Delivery**: Downstream workers continue to rely on database state checks (`status != RECEIVED`) to deduplicate redelivered messages.
+---
 
-## Phase 5 Implementation — Retry Handling & Exponential Backoff
+### Flow 3: Asynchronous Worker Processing & Attempt History
 
-### Architectural Flow & Components
-1. **RetryPolicy**:
-   - Implements exponential backoff: $d_n = \min(d_0 \times m^{n-1}, d_{\max})$.
-   - Calculates duration and deterministic UTC `nextRetryAt` timestamps.
-   - Evaluates `canRetry(attemptCount)` using `attemptCount < maxAttempts`.
-2. **Failure Handling Workflow in WebhookProcessingService**:
-   - On processor failure, creates and persists a failed `WebhookAttempt` with error details, attempt number, and completion time.
-   - If `attemptCount < maxAttempts`: updates `WebhookEvent` status to `RETRY_PENDING`, stores `lastError`, and persists `nextRetryAt`.
-   - If `attemptCount >= maxAttempts`: updates `WebhookEvent` status to `DEAD_LETTER`, stores `lastError`, and leaves `nextRetryAt` as null.
-3. **WebhookRetryScheduler**:
-   - Runs on scheduled intervals (`app.retry.scheduler-interval-ms: 1000`).
-   - Queries `WebhookEventRepository.findDueEventsForRetry(...)` where `status = 'RETRY_PENDING'` and `nextRetryAt <= now()`, ordered by `nextRetryAt ASC` with pagination.
-   - Concurrency & Race Condition Protection: Uses atomic conditional status transition `claimEventForRetry` (`UPDATE status RETRY_PENDING -> RECEIVED`). Only the instance that wins the race proceeds to create an `OutboxEvent` (status: `PENDING`) in the same database transaction.
-4. **Separation of Outbox Publication vs. Processing Retries**:
-   - Broker publication retries operate strictly at the transport level on `OutboxEvent` (`PENDING`).
-   - Business processing retries operate on `WebhookEvent` (`RETRY_PENDING`) and `WebhookAttempt`. A RabbitMQ network outage does not prematurely increment business attempt counts.
+The consumer listens to `webhook.processing`, acquires an exclusive database lock on the event, and executes business processing.
 
-## Phase 6 Implementation — Dead-Letter Handling & Controlled Event Replay
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Broker as RabbitMQ Queue
+    participant Consumer as WebhookProcessingConsumer
+    participant Svc as WebhookProcessingService
+    participant DB as PostgreSQL 16
+    participant Processor as WebhookEventProcessor
 
-### Architectural Overview
-Application-level dead-letter handling manages exhausted processing failures without coupling failure state to message broker topology.
-
-```text
-Processing Failure (Attempt >= maxAttempts)
-   ↓
-WebhookProcessingService
-   ├── Mark WebhookAttempt as FAILED (completedAt, errorMessage)
-   ├── Set WebhookEvent status to DEAD_LETTER
-   ├── Clear nextRetryAt (null)
-   └── Preserve attemptCount, lastError, and historical attempts
-         ↓
-WebhookRetryScheduler ignores DEAD_LETTER events
-         ↓
-Operator Inspection & Replay API (/api/v1/dead-letters)
-   ├── GET /api/v1/dead-letters (Paginated summary)
-   ├── GET /api/v1/dead-letters/{id} (Detailed failure & attempt history)
-   └── POST /api/v1/dead-letters/{id}/replay (Controlled replay via Outbox)
-         ↓
-[Atomic Database Transaction]
-   ├── Claim Event: UPDATE status DEAD_LETTER -> RECEIVED (WHERE status = 'DEAD_LETTER')
-   ├── Audit Replay: Insert into webhook_replays (reason, previous_attempt_count, requested_at)
-   └── Transactional Outbox: Insert OutboxEvent (PENDING, payload = WebhookProcessingMessage)
-         ↓
-OutboxPublisher dispatches to RabbitMQ
-         ↓
-WebhookProcessingConsumer -> WebhookProcessingService executes Attempt N+1
+    Broker->>Consumer: WebhookProcessingMessage (webhookEventId)
+    Consumer->>Svc: processEventById(webhookEventId)
+    Svc->>DB: findByIdForUpdate(id) [SELECT ... FOR UPDATE]
+    DB-->>Svc: WebhookEvent (locked)
+    alt Status != RECEIVED (Duplicate Delivery)
+        Svc-->>Consumer: Log & Skip (Acknowledge AMQP message)
+    else Status == RECEIVED
+        Svc->>DB: Update status = PROCESSING, attemptCount = attemptCount + 1
+        Svc->>DB: Insert WebhookAttempt (status = PROCESSING, attemptNumber = N)
+        Svc->>Processor: processEvent(event)
+        alt Processing Succeeded
+            Processor-->>Svc: Success
+            Svc->>DB: WebhookEvent status = COMPLETED, processedAt = now()
+            Svc->>DB: WebhookAttempt status = COMPLETED, completedAt = now()
+            Svc-->>Consumer: Done (ACK)
+        else Processing Threw Exception
+            Processor-->>Svc: Exception
+            Svc->>DB: Record failed WebhookAttempt (status = FAILED, error = ...)
+            alt attemptCount < maxAttempts
+                Svc->>DB: WebhookEvent status = RETRY_PENDING, nextRetryAt = now + delay
+            else attemptCount >= maxAttempts
+                Svc->>DB: WebhookEvent status = DEAD_LETTER, nextRetryAt = null
+            end
+            Note over Svc,DB: Committed via @Transactional(noRollbackFor = Exception.class)
+            Svc-->>Consumer: Propagate for AMQP DLQ / Reject
+        end
+    end
 ```
 
-### Components & Responsibilities
-1. **DeadLetterService**:
-   - Coordinates paginated listing of `DEAD_LETTER` events.
-   - Provides deep inspection returning `DeadLetterDetailResponse` with chronological attempt history from `webhook_attempts` and audit entries from `webhook_replays`.
-   - Executes atomic replay transactions via `claimEventForReplay` and outbox message creation.
-2. **DeadLetterController**:
-   - Exposes REST endpoints under `/api/v1/dead-letters` with OpenAPI documentation.
-   - Returns standard HTTP codes (`200 OK`, `202 Accepted`, `400 Bad Request`, `404 Not Found`, `409 Conflict`).
-3. **Database Schema & Audit Migration (V2)**:
-   - `idx_webhook_events_status_created_at` on `(status, created_at DESC)` for high-performance paginated dead-letter queries.
-   - `webhook_replays` audit table referencing `webhook_events(id)` tracking replay request timestamps, reasons, and previous attempt counts.
-4. **Concurrency Safety & Idempotent Replays**:
-   - Conditional SQL update `claimEventForReplay` acts as a distributed lock. If two operators or systems trigger replay concurrently, exactly one thread transitions the status and writes the outbox event; the second thread gets 0 updated rows and receives `409 Conflict`.
-5. **Attempt Continuity & Bounded Retry Limit**:
-   - Replay never resets `attemptCount` to zero or deletes prior `WebhookAttempt` records.
-   - The subsequent processing execution consumes attempt number `attemptCount + 1`.
-   - If the replayed execution fails, `canRetry(attemptCount + 1)` evaluates to `false` because the attempt count already exceeds `max-attempts`. The event transitions directly back to `DEAD_LETTER`, preventing automated infinite retry storms.
+---
 
-## Security & Role-Based Access Control Architecture (Phase 7)
+### Flow 4: Retry Scheduling & Exponential Backoff Engine
 
-### 1. Authentication & Operational Security
-- **Mechanism**: Spring Security with HTTP Basic authentication (`RestAuthenticationEntryPoint`) and completely stateless session management (`SessionCreationPolicy.STATELESS`).
-- **User Persistence**: Operational user accounts are stored in PostgreSQL table `security_users` (managed by Flyway migration `V3__create_security_users_table.sql`).
-- **Password Hashing**: Passwords are encrypted using BCrypt (`BCryptPasswordEncoder`). Plaintext passwords are never stored, logged, or returned in API responses.
-- **Error Consistency**:
-  - `RestAuthenticationEntryPoint` returns HTTP `401 Unauthorized` with `WWW-Authenticate` header and structured JSON `ErrorResponse`.
-  - `RestAccessDeniedHandler` returns HTTP `403 Forbidden` with structured JSON `ErrorResponse`.
+Failed events enter `RETRY_PENDING` with a deterministically calculated UTC timestamp:
+$$d_n = \min(d_0 \cdot m^{n-1}, d_{\max})$$
+Worker threads are not held sleeping in memory. Instead, a lightweight scheduler polls PostgreSQL for due events.
 
-### 2. Role-Based Authorization Policy
-Authorization is enforced through the Spring Security filter chain and method-level security (`@PreAuthorize`):
-- `ADMIN`: List dead-letters, inspect dead-letters, replay dead-letters, and manage operational administration.
-- `OPERATOR`: List dead-letters, inspect dead-letters, replay dead-letters.
-- `VIEWER`: List dead-letters, inspect dead-letters. Forbidden (`403`) from triggering event replays.
-- `Public / Unauthenticated`: Public webhook ingestion (`POST /api/v1/webhooks`) and infrastructure health endpoints (`/actuator/health`). All other unlisted application endpoints require authentication by default.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Scheduler as WebhookRetryScheduler (@Scheduled)
+    participant DB as PostgreSQL 16
+    participant TT as TransactionTemplate (Requires New)
+    participant Outbox as OutboxEventRepository
 
-### 3. Bootstrap Administrator Lifecycle
-- Controlled via `APP_SECURITY_BOOTSTRAP_USERNAME` and `APP_SECURITY_BOOTSTRAP_PASSWORD`.
-- `BootstrapAdminService` implements `ApplicationRunner`:
-  - If configuration is absent or blank, bootstrapping is disabled.
-  - Checks `securityUserRepository.existsByUsername(username)`: if the admin already exists, bootstrapping skips without overwriting the existing password hash.
-  - Plaintext password is never logged.
-  - Environment variables are isolated in `.env` (git-ignored) with placeholders in `.env.example`.
+    loop Scheduler Interval (e.g. 1000ms)
+        Scheduler->>DB: findDueEventsForRetry(status=RETRY_PENDING, nextRetryAt <= now())
+        DB-->>Scheduler: List<WebhookEvent>
+        loop For Each Due Event
+            Scheduler->>TT: execute(claimAndEnqueueRetry)
+            TT->>DB: Atomic Claim: UPDATE status RETRY_PENDING -> RECEIVED
+            alt Claim Won (1 row updated)
+                TT->>Outbox: save(OutboxEvent: status=PENDING, payload=WebhookProcessingMessage)
+                TT-->>Scheduler: Committed atomically
+            else Claim Lost (0 rows updated)
+                TT-->>Scheduler: Skip (claimed by concurrent scheduler node)
+            end
+        end
+    end
+```
 
-### 4. Public Webhook Trust Boundary
-- The webhook ingestion endpoint (`POST /api/v1/webhooks`) allows unauthenticated requests from external producers.
-- **Trust Boundary Note**: In this phase, the `source` field is client-provided in the payload and can be spoofed (cryptographic webhook signatures are not validated in Phase 7).
-- Ingestion is guarded against volumetric overload via Redis rate limiting.
+---
 
-## Redis Rate Limiting Architecture (Phase 7)
+### Flow 5: Dead-Letter Handling, Operator Inspection & Audited Replay
 
-### 1. Atomic Fixed-Window Algorithm
-- Evaluates traffic per webhook `source` across multiple application instances using a shared Redis instance.
-- **Atomic Lua Script**:
-  ```lua
-  local key = KEYS[1]
-  local limit = tonumber(ARGV[1])
-  local expireSeconds = tonumber(ARGV[2])
+When `attemptCount >= maxAttempts`, automatic retries cease and the event enters `DEAD_LETTER`. Operators inspect the chronological history and safely trigger replays.
 
-  local current = redis.call('INCR', key)
-  if current == 1 then
-      redis.call('EXPIRE', key, expireSeconds)
-  end
-  local ttl = redis.call('TTL', key)
-  if ttl == -1 then
-      redis.call('EXPIRE', key, expireSeconds)
-  end
-  return current
-  ```
-- **Atomicity Guarantee**: Redis executes Lua scripts in a single atomic thread. The `INCR` and conditional `EXPIRE` happen within the same atomic execution, preventing race conditions where keys could be created without TTL expiry.
-- **Epoch Partitioning**: Keys are partitioned by clock epoch window (`epochWindow = nowSeconds / windowSeconds`), guaranteeing immediate counter reset when window boundaries turn, and automatic eviction via TTL (`expireSeconds = windowSeconds * 2`).
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Operator as Operator (ROLE_OPERATOR / ROLE_ADMIN)
+    participant DLQCtrl as DeadLetterController
+    participant DLQSvc as DeadLetterService
+    participant DB as PostgreSQL 16
+    participant Outbox as OutboxEventRepository
 
-### 2. Bounded Key Strategy & Normalization
-- Redis Key: `app:ratelimit:src:<safeSource>:<epochWindow>`
-- Raw `source` values are trimmed and lowercased.
-- Safe alphanumeric values (`^[a-z0-9_-]{1,64}$`) are preserved.
-- Unbounded strings or values with special characters are converted to SHA-256 hex hashes (`hash_<sha256Hex>`), ensuring Redis keys are bounded and protected against key injection.
-- Null or blank values fallback safely to `"unknown"`.
+    Operator->>DLQCtrl: GET /api/v1/dead-letters/{id} (Basic Auth)
+    DLQCtrl->>DLQSvc: inspectDeadLetter(id)
+    DLQSvc->>DB: Load WebhookEvent, WebhookAttempts, WebhookReplays
+    DB-->>DLQSvc: Complete history
+    DLQSvc-->>DLQCtrl: DeadLetterDetailResponse
+    DLQCtrl-->>Operator: 200 OK (Attempt errors, timestamps, reasons)
 
-### 3. Rate Limit Behavior & Headers
-- **Under Limit**: Ingestion proceeds to transaction and outbox creation. Response contains `X-RateLimit-Limit` and `X-RateLimit-Remaining`.
-- **Exceeded Limit**: Request is rejected with HTTP `429 Too Many Requests`, headers `Retry-After: <secondsRemaining>`, `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`, and structured `ErrorResponse`.
-- **Transactional Safety**: Rejected requests abort before database interaction; no `WebhookEvent` or `OutboxEvent` records are created. Allowed duplicate requests preserve Phase 2 idempotency.
+    Operator->>DLQCtrl: POST /api/v1/dead-letters/{id}/replay {"reason": "Dependency fixed"}
+    DLQCtrl->>DLQSvc: replayDeadLetter(id, reason)
+    DLQSvc->>DB: Single ACID Transaction:
+    Note over DLQSvc,DB: Atomic Conditional Claim:<br/>UPDATE webhook_events SET status='RECEIVED', next_retry_at=NULL<br/>WHERE id=:id AND status='DEAD_LETTER'
+    alt Claim Failed (0 rows updated)
+        DB-->>DLQSvc: 0 rows (Already replayed or in race)
+        DLQSvc-->>DLQCtrl: throw InvalidStateTransitionException
+        DLQCtrl-->>Operator: 409 Conflict
+    else Claim Won (1 row updated)
+        DLQSvc->>DB: Insert WebhookReplay (reason, previousAttemptCount, requestedAt)
+        DLQSvc->>Outbox: Insert OutboxEvent (status=PENDING, payload=WebhookProcessingMessage)
+        DB-->>DLQSvc: Committed
+        DLQSvc-->>DLQCtrl: WebhookReplayResponsePayload
+        DLQCtrl-->>Operator: 202 Accepted {"status": "RECEIVED", "message": "enqueued"}
+    end
+```
 
-### 4. Redis Outage Handling (Fail-Closed Default)
-- **Fail-Closed (Default)**: If Redis is unavailable or times out, the rate limiter throws `RateLimiterUnavailableException`. `GlobalExceptionHandler` converts this to HTTP `503 Service Unavailable` with `Retry-After: 30`. No internal Redis stack traces or keys are leaked to clients.
-- **Fail-Open (Configurable)**: If `app.rate-limit.fail-closed=false`, outages log a warning and allow traffic, prioritizing ingestion availability over enforcement.
+---
 
-## Reconciliation Engine Architecture (Phase 8)
+### Flow 6: Spring Security RBAC & Atomic Redis Rate Limiting
 
-### 1. Source-of-Truth Abstraction
-- **Interface**: `SourceOfTruthClient` with method `Optional<ExternalEventRecord> fetchExternalRecord(String source, String eventId) throws ExternalProviderException`.
-- **Deterministic Simulation (`SimulatedSourceOfTruthClient`)**:
-  - Independent of the reconciliation algorithm; provides reference data for local development and automated testing.
-  - Suffix patterns:
-    - `_notfound`: Simulates missing records in the external provider (`Optional.empty()`).
-    - `_mismatch`: Simulates status mismatch (`FAILED` vs `COMPLETED`).
-    - `_corrected`: Simulates external settlement with adjustment (`SETTLED_WITH_ADJUSTMENT`).
-    - `_error`: Simulates upstream network timeout / outage (`ExternalProviderException`).
-    - Default: Simulates matching reference state (`COMPLETED` / `PAID`).
-  - Supports programmatic test overrides via `registerRecord(source, eventId, record)` and `registerFailure(source, eventId, errorMessage)`.
+Ingestion traffic is protected against denial-of-service and flooding using distributed fixed-window rate limiting in Redis. Administrative endpoints are protected via stateless Spring Security HTTP Basic authentication.
 
-### 2. Event Eligibility Rules
-Reconciliation operates exclusively on terminal webhook events:
-- Internal status must be terminal: `COMPLETED`, `DEAD_LETTER`, or `FAILED`. In-flight events (`RECEIVED`, `PROCESSING`, `RETRY_PENDING`) are excluded from reconciliation until execution concludes.
-- By default, events that already possess an audit record in `reconciliation_records` are excluded from new batches.
-- Operators may set `includeAlreadyReconciled = true` to force re-evaluation of previously reconciled events.
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as HTTP Client
+    participant Sec as SecurityFilterChain
+    participant Ratelimit as RedisRateLimiterService
+    participant Redis as Redis 7 (In-Memory)
+    participant Endpoint as Controller Endpoint
 
-### 3. Comparison & Classification Rules
-Each event is evaluated independently and classified into one of four states:
-- `MATCHED`:
-  - Internal `COMPLETED` matches external `COMPLETED`, `PAID`, `SUCCEEDED`, `SUCCESS`, or `DELIVERED`.
-  - Internal `DEAD_LETTER` / `FAILED` matches external `FAILED`, `DEAD_LETTER`, `CANCELLED`, `REJECTED`, or `ERROR`.
-- `CORRECTED`:
-  - External status indicates a safe settlement or adjustment (`SETTLED_WITH_ADJUSTMENT`, `RESOLVED_EXTERNALLY`, `MANUALLY_SETTLED`).
-  - Safe audit detail is recorded in the JSON audit payload without mutating immutable webhook event history (`WebhookEvent.status` is preserved).
-- `MISMATCH`:
-  - Internal status contradicts external status (e.g. internal `COMPLETED` but external `FAILED`, or internal `DEAD_LETTER` but external `PAID`).
-  - External reference record is not found (`externalStatus = NOT_FOUND`).
-- `FAILED`:
-  - External provider throws `ExternalProviderException` (network timeout, rate limit, provider 5xx).
-  - Recorded as `FAILED` with provider error details; does not abort the remainder of the reconciliation batch.
+    Client->>Sec: HTTP Request
+    alt Request to /api/v1/webhooks
+        Sec-->>Ratelimit: Public Access Allowed -> Execute Rate Limiter
+        Ratelimit->>Redis: EVAL Lua Script (INCR key, EXPIRE if 1, TTL)
+        Redis-->>Ratelimit: Current Count
+        alt Count > Capacity (e.g. 60)
+            Ratelimit-->>Client: 429 Too Many Requests (Retry-After: N)
+        else Count <= Capacity
+            Ratelimit->>Endpoint: Proceed to WebhookController
+        end
+    else Request to /api/v1/dead-letters/** or /api/v1/reconciliation/**
+        alt Missing or Invalid HTTP Basic Credentials
+            Sec-->>Client: 401 Unauthorized (WWW-Authenticate: Basic)
+        else Valid Credentials, Insufficient Role (e.g. VIEWER on POST /replay)
+            Sec-->>Client: 403 Forbidden (RestAccessDeniedHandler)
+        else Valid Credentials, Authorized Role (e.g. OPERATOR on POST /replay)
+            Sec->>Endpoint: Proceed to Controller Endpoint
+        end
+    end
+```
 
-### 4. Reliability, Deduplication & Concurrency
-- **Bounded Batches**: Default batch size is 50, capped at 100 via `ReconciliationProperties`. Prevents unbounded table scans and memory exhaustion.
-- **Per-Event Transaction Isolation**: `reconcileSingleEvent` executes with `Propagation.REQUIRES_NEW`. A failure or provider outage on one event commits its `FAILED` audit record without rolling back or failing the remaining batch.
-- **Database Uniqueness Constraint**: Flyway `V4__create_reconciliation_indexes_and_constraints.sql` adds `uk_reconciliation_records_event_id` on `reconciliation_records(webhook_event_id)`.
-- **Race Condition Tolerance**: If concurrent runs evaluate the same event simultaneously, database constraints prevent duplicate records, and the losing thread catches `DataIntegrityViolationException` to fetch and return the existing record cleanly.
+---
 
-### 5. API & Role-Based Security Matrix
-- `POST /api/v1/reconciliation/runs`: Restricted to `ADMIN` and `OPERATOR`. `VIEWER` is denied with `403 Forbidden`.
-- `GET /api/v1/reconciliation/records`: Accessible to `ADMIN`, `OPERATOR`, and `VIEWER`. Supports pagination and filtering by `result` and `source`.
-- `GET /api/v1/reconciliation/records/{id}`: Accessible to `ADMIN`, `OPERATOR`, and `VIEWER`. Returns detailed record with parsed JSON comparison audit.
-- Unauthenticated requests receive HTTP `401 Unauthorized`.
+### Flow 7: Reconciliation Workflow against Simulated Source of Truth
 
-## Current Limitations
+Reconciliation runs periodically verify internal processing results against an independent external source of truth.
 
-- Webhook provider signature verification (HMAC) is not implemented in this phase.
-- Automatic mutation of webhook history on `CORRECTED` is intentionally disallowed to preserve audit immutability.
-- Administrative web UI is planned for a later phase.
+> [!NOTE]
+> The source-of-truth client in this phase is an abstraction (`SourceOfTruthClient`) implemented by `SimulatedSourceOfTruthClient`. It deterministically generates reference states for testing without relying on live third-party network connections.
 
-## Future Architecture
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Admin as Admin / Operator
+    participant ReconCtrl as ReconciliationController
+    participant ReconSvc as ReconciliationServiceImpl
+    participant DB as PostgreSQL 16
+    participant Client as SourceOfTruthClient (Simulated)
 
-The following capabilities are planned:
+    Admin->>ReconCtrl: POST /api/v1/reconciliation/runs {"batchSize": 50, "source": "stripe"}
+    ReconCtrl->>ReconSvc: runReconciliation(request)
+    ReconSvc->>DB: Query eligible terminal events (status IN COMPLETED, DEAD_LETTER, FAILED)
+    DB-->>ReconSvc: List<WebhookEvent>
+    loop For Each Eligible Event
+        Note over ReconSvc,DB: Isolated Transaction Boundary: Propagation.REQUIRES_NEW
+        ReconSvc->>DB: findByIdForUpdate(event.getId())
+        ReconSvc->>Client: fetchExternalRecord(source, eventId)
+        alt External Match
+            Client-->>ReconSvc: ExternalEventRecord (status: COMPLETED)
+            ReconSvc->>DB: Persist ReconciliationRecord (result = MATCHED)
+        else External Confirms Settlement but Local Failed
+            Client-->>ReconSvc: ExternalEventRecord (status: SETTLED_WITH_ADJUSTMENT)
+            ReconSvc->>DB: Persist ReconciliationRecord (result = CORRECTED, audit snapshot)
+        else External Contradicts Local
+            Client-->>ReconSvc: ExternalEventRecord (status: FAILED / NOT_FOUND)
+            ReconSvc->>DB: Persist ReconciliationRecord (result = MISMATCH, discrepancy reason)
+        else Provider Network Outage
+            Client-->>ReconSvc: throws ExternalProviderException
+            ReconSvc->>DB: Persist ReconciliationRecord (result = FAILED, error detail)
+        end
+    end
+    ReconSvc-->>ReconCtrl: ReconciliationRunResponse (batch statistics)
+    ReconCtrl-->>Admin: 200 OK {totalEligible, processedCount, matchedCount, ...}
+```
 
-| Capability | Phase | Notes |
+---
+
+## 4. Key Architectural Decisions & Rationale
+
+### 1. Why the Transactional Outbox Pattern?
+- **The Problem**: In a distributed system, a single process cannot atomically commit a row to a database and publish a message to a broker without distributed transactions (2PC / XA), which introduce severe latency and single points of failure.
+- **The Decision**: Both the `WebhookEvent` and the `OutboxEvent` are written to PostgreSQL in the exact same ACID database transaction.
+- **Why It Matters**: If PostgreSQL commits, the outbox record is guaranteed to exist. A background poller then dispatches the message to RabbitMQ with publisher confirms. Even if the application crashes or RabbitMQ is temporarily down, the event will never be lost.
+
+### 2. Why At-Least-Once Delivery + Consumer Idempotency?
+- **The Problem**: Distributed network partitions and acknowledgements make "exactly-once delivery" physically impossible across message brokers. If a worker finishes processing but crashes before acknowledging RabbitMQ, the broker will redeliver the message.
+- **The Decision**: Accept at-least-once message delivery and enforce strict idempotency at the database boundary.
+- **Why It Matters**: Workers inspect the authoritative status of the event under a row-level lock (`SELECT ... FOR UPDATE`). If the event is already `COMPLETED`, `PROCESSING`, `RETRY_PENDING`, or `DEAD_LETTER`, the worker acknowledges the AMQP delivery and skips execution. Exactly-once *processing semantics* are guaranteed without relying on unsupported broker guarantees.
+
+### 3. Why Flyway Migrations & `ddl-auto: validate`?
+- **The Problem**: Allowing Hibernate to auto-generate or alter database schemas (`ddl-auto: update`) in production causes silent schema divergence, lock contention, and untracked changes across cluster nodes.
+- **The Decision**: Flyway executes immutable, versioned SQL scripts (`V1` through `V4`) during startup. Hibernate is configured strictly to `validate`.
+- **Why It Matters**: Schema modifications are versioned in Git, auditable, reproducible, and tested identically across development, CI, and production.
+
+### 4. Why Database Concurrency Controls (Row Locks & Constraints)?
+- **The Problem**: Distributed workers running concurrently can pull duplicate copies of the same message or duplicate replay requests simultaneously, resulting in dual executions and inconsistent attempt counts.
+- **The Decision**: Combine three distinct concurrency safeguards:
+  1. **Relational Unique Constraints**: `UNIQUE(source, event_id)`, `UNIQUE(webhook_event_id, attempt_number)`, and `UNIQUE(webhook_event_id)`.
+  2. **Pessimistic Row Locks (`SELECT ... FOR UPDATE`)**: In `WebhookProcessingService` and `ReconciliationServiceImpl`, serialize concurrent executions targeting the same webhook event.
+  3. **Atomic Conditional SQL Updates**: In `WebhookRetryScheduler` and `DeadLetterService`, execute `UPDATE ... WHERE id = :id AND status = :expectedStatus`. Exactly one thread modifies the row; losing threads observe 0 updated rows and back off.
+
+### 5. Why Isolated Transaction Boundaries (`TransactionTemplate` & `REQUIRES_NEW`)?
+- **The Problem**:
+  - In `WebhookProcessingService`, catching an exception, updating state to `RETRY_PENDING`, and then throwing an exception would normally trigger a Spring rollback, discarding the failure attempt.
+  - In `WebhookRetryScheduler` and `ReconciliationServiceImpl`, internal helper methods called on `this` bypass Spring AOP transaction interceptors, causing `TransactionRequiredException` or shared transaction failure cascades.
+- **The Decision**:
+  - Configured `WebhookProcessingService` with `@Transactional(noRollbackFor = Exception.class)`.
+  - Injected `PlatformTransactionManager` into schedulers and reconciliation services to execute discrete units of work within explicit `TransactionTemplate` instances with `PROPAGATION_REQUIRES_NEW`.
+- **Why It Matters**: A failure on a single webhook during a reconciliation run commits its own `FAILED` record without rolling back or poisoning the surrounding batch.
+
+---
+
+## 5. Infrastructure & Resilience Components
+
+| Component | Technology | Configuration & Resilience Features |
 |---|---|---|
-| Webhook event persistence | Phase 1 | Completed: Domain model and Flyway migrations |
-| Webhook reception endpoints | Phase 2 | Completed: Ingestion API, validation, idempotency |
-| RabbitMQ async processing | Phase 3 | Completed: Broker configuration, publisher, consumer, worker lifecycle |
-| Transactional Outbox Pattern | Phase 4 | Completed: Atomic DB write, scheduled outbox poller, publisher confirms |
-| Retry with exponential backoff | Phase 5 | Completed: Database-backed retries, backoff policy, retry scheduler |
-| DLQ & manual replay | Phase 6 | Completed: Dead-letter state, inspection API, outbox replay, audit trail |
-| Security & Redis Rate Limiting | Phase 7 | Completed: Basic Auth, RBAC matrix, admin bootstrap, Redis atomic rate limiter |
-| Reconciliation engine | Phase 8 | Completed: Source-of-truth abstraction, bounded runs, audit records, RBAC |
-| Observability & metrics | Phase 9 | Micrometer Prometheus, dashboards |
-| Performance & Production Readiness | Phase 10 | Benchmark, tuning, production checklist |
+| **Primary Database** | PostgreSQL 16 | HikariCP connection pool (min: 2, max: 10), connection timeout 20s, UTC timestamps (`TIMESTAMP WITH TIME ZONE`), JSONB native columns. |
+| **Message Broker** | RabbitMQ 3.13 | Correlated publisher confirms (`publisher-confirm-type: correlated`), publisher returns enabled, durable direct exchange (`webhook.events`), durable queue (`webhook.processing`). |
+| **Distributed Cache** | Redis 7 | Standalone / Cluster support, atomic Lua scripts, configurable fail-closed policy (`RATE_LIMIT_FAIL_CLOSED=true`) returning HTTP 503 on outages. |
+| **Application Runtime** | Spring Boot 3.4 / Java 21 | Graceful shutdown (`server.shutdown: graceful`, 30s timeout per phase), stateless HTTP sessions, health probes via Spring Actuator. |
 
+---
 
+## 6. Known Limitations & Architecture Roadmap
 
+- **Simulated Source of Truth**: The reconciliation engine uses `SimulatedSourceOfTruthClient`. Production deployments require concrete adapters implementing `SourceOfTruthClient` for each provider (e.g., Stripe, PayPal, Shopify).
+- **Cryptographic Provider Signatures**: The public ingestion endpoint validates JSON payloads and enforces Redis rate limiting, but does not yet verify cryptographic provider HMAC SHA-256 signatures (scheduled for Phase 11).
+- **Non-Mutating `CORRECTED` Audits**: When reconciliation identifies an external settlement for a locally failed event, it records a `CORRECTED` audit record but preserves the internal event status to maintain historical immutability.

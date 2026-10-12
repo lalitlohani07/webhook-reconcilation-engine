@@ -15,6 +15,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 
 @Component
 @ConditionalOnProperty(name = "app.outbox.enabled", havingValue = "true", matchIfMissing = true)
@@ -61,6 +62,14 @@ public class OutboxPublisher {
     }
 
     public void publishSingleEvent(OutboxEvent outboxEvent) {
+        // Guard against duplicate concurrent processing if record was already published or failed
+        Optional<OutboxEvent> fresh = outboxEventRepository.findById(outboxEvent.getId());
+        if (fresh.isPresent() && fresh.get().getStatus() != OutboxStatus.PENDING) {
+            log.info("Outbox record {} is no longer PENDING (status: {}). Skipping publication.",
+                outboxEvent.getId(), fresh.get().getStatus());
+            return;
+        }
+
         log.info("Publication started for outboxId={}, aggregateId={}, eventType={}",
             outboxEvent.getId(), outboxEvent.getAggregateId(), outboxEvent.getEventType());
 
